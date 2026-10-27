@@ -87,6 +87,8 @@ saved outcome. A refusal (`CreateOutcome::Refused`, `Outcome::Refused`) lists
   legal entity type, jurisdiction (`bilibi_geonames::country_known`, so no
   jurisdiction is recordable until countries are imported) and code
   uniqueness on the write's transaction under a per-code advisory lock.
+  It also runs the parent depth check and the duplicate rule (see
+  "Duplicate candidates and company trees").
 - `bilibi_company::require_writable` is the one archived check: a live company
   whose status is `archived` is read-only for good, for its own facts and
   every record it owns. Reads never ask it.
@@ -121,10 +123,12 @@ edits are rejected in the domain too.
 
 ## Agent operations
 
-`agent_operations.rs` registers `core.company.list` and `core.company.get`
-(reads) and `core.company.create` (a reviewed safe write: preview shares
-create's validation and code check without reserving it, commit writes
-through the plan's transaction) plus the `core.company` guide. A restricted
+`agent_operations.rs` registers `core.company.list`, `core.company.get`,
+`core.company.duplicates` and `core.company.hierarchy` (reads) and
+`core.company.create` (a reviewed safe write: preview shares create's
+validation, code check, depth check and duplicate rule without reserving the
+code, and lists the likely duplicates; commit writes through the plan's
+transaction) plus the `core.company` guide. A restricted
 field arrives as `{"restricted": true}`. The handlers read through a pool
 bound once by the service factory.
 
@@ -383,7 +387,8 @@ audited transaction. Detail uses shared read-first inline text, choice and
 long-text controls, activity chips with confirmed removal, per-field commit
 outcomes and version fencing. Legacy activity JSON objects remain editable
 without silently converting their business meaning. Parent
-changes serialize on the tenant and reject a cycle. Lifecycle buttons come
+changes serialize on the tenant and reject a cycle or a tree deeper than the
+tenant's limit, in words beside the field. Lifecycle buttons come
 only from `lifecycle_operations`, hold the record version in server state,
 and confirm with an optional reason; archive remains final. Record pins use
 the shell's existing account pin API, with a resolved record label and URL. The Audit history
@@ -455,6 +460,89 @@ Company scalar facts share a record-field schema with Grid. Optional columns inc
 `CompanyService::preview_tenant_companies` and `provision_new_tenant_in` compose tenant provisioning with [Core Tenant Administration](../tenant_administration/README.md). Names use ordinary Company validation, generated codes and the person's field restrictions; duplicate generated codes are refused. The first company becomes primary.
 
 The write requires Tenancy's sealed `CreatedTenant` receipt, bound to the current transaction and original actor. It accepts no arbitrary target tenant id and never changes the caller's scope. Tenant-create capability and live operator standing authorize the complete provisioning action; its contract enforces Base Step-up. Every company and primary assignment is a `Change` on that same transaction. Existing tenant business data remains behind its ordinary scoped facade.
+
+## Duplicate candidates and company trees
+
+Core Company proposes the existing companies a new one looks like, and keeps company trees finite. It never chooses or merges.
+
+### Match keys
+
+Migration `008-match-keys` stores each company's normalised facts as generated columns, using SQL functions the duplicate query also applies to its criteria. No extension is needed.
+
+| Column | Made from | Rule |
+| --- | --- | --- |
+| `name_tokens` | name and legal name | Lower-case words of letters and digits, Latin accents folded; GIN index |
+| `website_host` | website | Host without scheme, `www.`, port, path or trailing dot |
+| `email_domain` | email | Domain after `@`, lower case |
+| `phone_digits` | phone | Digits only, when there are at least 7 |
+| `registration_key` | registration number | Letters and digits, upper case |
+
+Each exact key has a partial index per tenant.
+
+### Scoring
+
+| Fact that matches | Score |
+| --- | --- |
+| Same `registration_key` | 1.0 |
+| Same `website_host` or same `email_domain` | 0.9 |
+| Same `phone_digits` | 0.85 |
+| Name | `pg_trgm`-style trigram similarity, computed in Rust |
+
+- Name similarity compares the name and legal name on both sides, without the tenant's ignored words, over at most 200 companies preselected by shared name words (exact-key matches first).
+- A public mail domain never matches.
+- A candidate's score is its best fact. Results are the candidates at or above the threshold, best first, 1–100 (default 10), each with every matched fact at or above the threshold.
+- Archived companies are included and keep their status; soft-deleted ones are not. `except_id` leaves out the company being edited.
+
+### Reading candidates
+
+- `CompanyService::duplicates(scope, &DuplicateQuery)` and `core.company.duplicates` need `admin.company.list`.
+- A criterion on a field the reader's role restricts (registration number, website, email, phone) is refused, never searched. Restricted values in the results carry the mask (`{"restricted": true}` for agents).
+- Other tenants' companies never appear.
+
+### Creating anyway
+
+`NewCompany.create_anyway` (`CreateAnyway { candidate_ids, reason }`) is taken by `create_company`, `create_with_context` and `core.company.create`. The reason (1–500 characters, trimmed) and the candidate ids (sorted, once each) go into the create's audit `Change` as `create_anyway`.
+
+| `company.duplicates.on_create` | A create that looks like existing companies |
+| --- | --- |
+| `suggest` (default) | Goes ahead; a supplied reason is kept |
+| `require_reason` | Reruns the match in its transaction, under an advisory lock on the normalised name, and is refused on `create_anyway` unless the reason names every candidate |
+
+The refusal names the candidate ids only to a reader with `admin.company.list`. The create preview refuses the same way and lists the candidates the reader may see.
+
+### Parent checks
+
+Every write that sets a parent (create, and Parent Company on the detail page) takes the tenant row lock first, then refuses on `parent_id`:
+
+- the company itself: "cannot be the company itself";
+- a loop: "cannot be one of its own subsidiaries";
+- too deep: "would make the company tree deeper than N levels", when the new parent's chain plus the moving subtree's height exceeds `company.hierarchy.max_depth` **and** the subtree's deepest company would end up lower than it is now. A tree already deeper than the limit stays valid; only changes that make it deeper are refused.
+
+The detail page shows these in the field's words ("Parent Company cannot be one of its own subsidiaries."); `save_fact` returns them as `WriteError::Invalid`.
+
+### Hierarchy read
+
+`CompanyService::hierarchy(scope, id)` and `core.company.hierarchy` need `admin.company.view`. They return the company, its ancestors (root first) and its descendants (by level, then name), each with id, parent id, name, code, status and `level` (the parent is -1, a child 1).
+
+- Each side stops at `max_depth - 1` levels, and both together at 1,000 companies; `truncated` says more exist.
+- A walk stops at a soft-deleted company.
+
+### Settings
+
+Tenant settings over a global default, on System Settings under "Companies" (Global and This tenant).
+
+| Key | Default | Range |
+| --- | --- | --- |
+| `company.duplicates.threshold` | 0.8 | 0.5–1.0 |
+| `company.duplicates.on_create` | `suggest` | `suggest` or `require_reason` |
+| `company.duplicates.ignored_words` | `sdn`, `bhd`, `ltd`, `limited`, `inc`, `llc`, `plc`, `pte`, `pty`, `gmbh`, `corp` | Up to 200 words |
+| `company.duplicates.public_mail_domains` | Common free mail domains (`gmail.com`, `outlook.com`, `yahoo.com`, …) | Up to 200 domains |
+| `company.hierarchy.max_depth` | 10 | 2–20 |
+
+### Pages
+
+- Create Company checks the draft as the person types and lists the likely duplicates under the form: name, status, matched facts, score and **Use existing**, which opens the record. **Create anyway** asks for the reason in a confirmation dialog. When the tenant requires a reason, Create Company opens that dialog instead of creating.
+- A company with a parent shows its **Parent Chain**: links from the root down to the parent, then the company itself. An ellipsis stands for levels above the limit.
 
 ## Postal addresses
 

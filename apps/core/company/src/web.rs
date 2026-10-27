@@ -10,7 +10,7 @@ mod reference_types;
 pub(super) mod relationships;
 mod setup;
 mod views;
-use crate::{lifecycle::Operation, CreateOutcome, Edit, FieldError, Params};
+use crate::{lifecycle::Operation, CreateOutcome, Edit, FieldError, Params, WriteError};
 use bilibi_database::{Db, Error, Result};
 use bilibi_grid::{PageColumns, PageViews};
 use bilibi_tenancy::Scope;
@@ -183,6 +183,8 @@ impl Pages {
             .map_err(|_| Error::Internal)?,
             form: HashMap::from([("status".into(), "active".into())]),
             errors: Vec::new(),
+            candidates: Vec::new(),
+            anyway: None,
             pending: None,
             pending_activity: None,
             history: false,
@@ -310,6 +312,14 @@ struct Pending {
     reason: String,
     error: String,
 }
+/// The open Create anyway dialog: the candidates shown when it opened, the
+/// reason typed so far, and whether the tenant refused a create without one.
+pub(super) struct Anyway {
+    candidate_ids: Vec<i64>,
+    reason: String,
+    error: String,
+    required: bool,
+}
 struct CompanyPage {
     db: Db,
     company: Arc<crate::CompanyService>,
@@ -330,6 +340,9 @@ struct CompanyPage {
     children_columns: ListColumns,
     form: HashMap<String, String>,
     errors: Vec<FieldError>,
+    /// The create draft's likely duplicates, and the Create anyway dialog.
+    candidates: Vec<crate::DuplicateCandidate>,
+    anyway: Option<Anyway>,
     pending: Option<Pending>,
     pending_activity: Option<(String, i64)>,
     history: bool,
@@ -468,7 +481,19 @@ impl CompanyPage {
                 )
                 .await?
             }
-            "create" => views::create(&**client, scope, &self.form, &self.errors).await?,
+            "create" => {
+                views::create(
+                    &**client,
+                    scope,
+                    views::CreateState {
+                        values: &self.form,
+                        errors: &self.errors,
+                        candidates: &self.candidates,
+                        anyway: self.anyway.as_ref(),
+                    },
+                )
+                .await?
+            }
             _ => return Err(Error::NotFound),
         };
         Ok(LiveBody {
@@ -557,15 +582,31 @@ impl CompanyPage {
                 let result = self.company.save_fact(scope, credential, &edit).await;
                 let status = match result {
                     Ok(()) => CommitStatus::Saved,
-                    Err(Error::Unauthorized) => return Err(Error::Unauthorized),
-                    Err(Error::Forbidden) => {
+                    // A named refusal (a parent that loops or goes too deep).
+                    Err(WriteError::Invalid(errors)) => CommitStatus::Error(
+                        errors
+                            .iter()
+                            .map(|error| {
+                                let label = fields::ALL
+                                    .iter()
+                                    .find(|field| field.id == error.field)
+                                    .map_or("This value", |field| field.label);
+                                bilibi_ui::error_sentence(label, &error.message)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    Err(WriteError::Access(Error::Unauthorized)) => {
+                        return Err(Error::Unauthorized)
+                    }
+                    Err(WriteError::Access(Error::Forbidden)) => {
                         self.notice="You no longer have permission to change this company, or the company is archived.".into();
                         CommitStatus::Error(self.notice.clone())
                     }
-                    Err(Error::Conflict) => CommitStatus::Error(
+                    Err(WriteError::Access(Error::Conflict)) => CommitStatus::Error(
                         "The record changed. Your draft is kept; reload before saving.".into(),
                     ),
-                    Err(Error::Invalid) => CommitStatus::Error(
+                    Err(WriteError::Access(Error::Invalid)) => CommitStatus::Error(
                         "The value was not saved. Check its format, length and references.".into(),
                     ),
                     Err(_) => CommitStatus::failure(),
@@ -623,11 +664,13 @@ impl CompanyPage {
                     };
                     let status = match self.company.save_fact(scope, credential, &edit).await {
                         Ok(()) => CommitStatus::Saved,
-                        Err(Error::Unauthorized) => return Err(Error::Unauthorized),
-                        Err(Error::Conflict) => CommitStatus::Error(
+                        Err(WriteError::Access(Error::Unauthorized)) => {
+                            return Err(Error::Unauthorized)
+                        }
+                        Err(WriteError::Access(Error::Conflict)) => CommitStatus::Error(
                             "The record changed. Reload before changing its activities.".into(),
                         ),
-                        Err(Error::Forbidden) => CommitStatus::Error(
+                        Err(WriteError::Access(Error::Forbidden)) => CommitStatus::Error(
                             "The activity was not saved: this company is read-only.".into(),
                         ),
                         Err(_) => CommitStatus::failure(),
@@ -678,34 +721,152 @@ impl CompanyPage {
                     Err(error) => pending.error = error.to_string(),
                 }
             }
+            "check_company" if self.operation == "create" => {
+                self.read_form(value)?;
+                self.check_duplicates(scope).await?;
+            }
             "create_company" if self.operation == "create" => {
-                self.form = value
-                    .as_object()
-                    .ok_or(Error::Invalid)?
-                    .iter()
-                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.into())))
-                    .filter(|(k, _)| k != "type")
-                    .collect();
-                let (new, activities, metadata, errors) = views::new_company(&self.form);
-                self.errors = errors;
-                if self.errors.is_empty() {
-                    match self
-                        .company
-                        .create_with_context(scope, &new, activities, metadata)
-                        .await?
-                    {
-                        CreateOutcome::Created(_) => {
-                            self.landing
-                                .put(StatusKind::Success, "Company created successfully.");
-                            return Ok(Some("/companies".into()));
-                        }
-                        CreateOutcome::Refused(errors) => self.errors = errors,
-                    }
+                self.read_form(value)?;
+                self.check_duplicates(scope).await?;
+                return self.create(scope, None).await;
+            }
+            "request_create_anyway" if self.operation == "create" => {
+                if self.candidates.is_empty() {
+                    return Err(Error::Invalid);
                 }
+                self.anyway = Some(Anyway {
+                    candidate_ids: self.candidates.iter().map(|c| c.company.id).collect(),
+                    reason: String::new(),
+                    error: String::new(),
+                    required: false,
+                });
+            }
+            "cancel_create_anyway" => self.anyway = None,
+            "confirm_create_anyway" if self.operation == "create" => {
+                let anyway = self.anyway.as_mut().ok_or(Error::Invalid)?;
+                anyway.reason = get("reason").into();
+                if anyway.reason.trim().is_empty() {
+                    anyway.error = "Give a reason to create this company anyway.".into();
+                    return Ok(None);
+                }
+                let request = crate::CreateAnyway {
+                    candidate_ids: anyway.candidate_ids.clone(),
+                    reason: anyway.reason.clone(),
+                };
+                return self.create(scope, Some(request)).await;
             }
             _ => return Err(Error::Invalid),
         }
         Ok(None)
+    }
+}
+impl CompanyPage {
+    /// Takes the posted create form as the draft.
+    fn read_form(&mut self, value: &Value) -> Result<()> {
+        self.form = value
+            .as_object()
+            .ok_or(Error::Invalid)?
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.into())))
+            .filter(|(k, _)| k != "type")
+            .collect();
+        Ok(())
+    }
+    /// The draft's likely duplicates. A reader who may not list companies, or
+    /// a draft with nothing to match yet, sees none.
+    async fn check_duplicates(&mut self, scope: &Scope) -> Result<()> {
+        let text = |name: &str| {
+            self.form
+                .get(name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let query = crate::DuplicateQuery {
+            name: text("name"),
+            legal_name: text("legal_name"),
+            registration_number: text("registration_number"),
+            website: text("website"),
+            email: text("email"),
+            ..crate::DuplicateQuery::default()
+        };
+        self.candidates = match self.company.duplicates(scope, &query).await {
+            Ok(candidates) => candidates,
+            Err(Error::Forbidden | Error::Invalid) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(())
+    }
+    /// Creates the draft, with the reason when Create anyway was confirmed.
+    /// A refusal on the reason opens (or keeps) the dialog over the current
+    /// candidates; every other refusal shows on the form.
+    async fn create(
+        &mut self,
+        scope: &Scope,
+        anyway: Option<crate::CreateAnyway>,
+    ) -> Result<Option<String>> {
+        let (mut new, activities, metadata, errors) = views::new_company(&self.form);
+        self.errors = errors;
+        if !self.errors.is_empty() {
+            self.anyway = None;
+            return Ok(None);
+        }
+        let confirmed = anyway.is_some();
+        new.create_anyway = anyway;
+        match self
+            .company
+            .create_with_context(scope, &new, activities, metadata)
+            .await?
+        {
+            CreateOutcome::Created(_) => {
+                self.anyway = None;
+                self.landing
+                    .put(StatusKind::Success, "Company created successfully.");
+                Ok(Some("/companies".into()))
+            }
+            CreateOutcome::Refused(errors) => {
+                let (reason, others): (Vec<_>, Vec<_>) = errors
+                    .into_iter()
+                    .partition(|error| error.field == "create_anyway");
+                if reason.is_empty() || !others.is_empty() {
+                    self.anyway = None;
+                    self.errors = others;
+                    self.errors.extend(reason);
+                    return Ok(None);
+                }
+                self.check_duplicates(scope).await?;
+                if self.candidates.is_empty() {
+                    // Nothing this reader can review: say why on the form.
+                    self.anyway = None;
+                    self.errors = reason;
+                    return Ok(None);
+                }
+                let candidate_ids: Vec<i64> =
+                    self.candidates.iter().map(|c| c.company.id).collect();
+                let (typed, reviewed) = self
+                    .anyway
+                    .take()
+                    .map(|open| (open.reason, open.candidate_ids))
+                    .unwrap_or_default();
+                let error = if !confirmed {
+                    String::new()
+                } else if reviewed != candidate_ids {
+                    "The likely duplicates changed. Review them under the form, then create anyway again.".into()
+                } else {
+                    reason
+                        .iter()
+                        .map(|error| bilibi_ui::error_sentence("Create anyway", &error.message))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                self.anyway = Some(Anyway {
+                    candidate_ids,
+                    reason: typed,
+                    error,
+                    required: true,
+                });
+                Ok(None)
+            }
+        }
     }
 }
 impl LiveState<Scope, Error> for CompanyPage {

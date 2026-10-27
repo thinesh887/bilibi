@@ -5,10 +5,14 @@
 //! `core.company.create` is a reviewed safe write (`admin.company.create`)
 //! whose preview shares create's defaults, validation and restricted-field
 //! refusal and whose commit writes through the plan's audited transaction.
+//! `core.company.duplicates` and `core.company.hierarchy` (issue 139) read the
+//! likely duplicates of a prospective company and a company's tree.
 //! The facade masks every field the reader may not see, so such a field
 //! arrives as `{"restricted": true}`.
 use crate::{
     contributions::{CREATE, LIST, VIEW},
+    duplicates::{self, DuplicateQuery},
+    hierarchy,
     organisation::{self, NewCompany, SearchQuery, INITIAL_STATUSES, STATUSES},
     FieldError,
 };
@@ -130,6 +134,64 @@ impl ReadHandler for Get {
     }
 }
 
+struct Duplicates;
+impl ReadHandler for Duplicates {
+    fn owner(&self) -> &'static str {
+        "core/company"
+    }
+    fn call<'a>(
+        &'a self,
+        _client: &'a dyn OperationClient,
+        scope: &'a Scope,
+        input: &'a Value,
+    ) -> OperationFuture<'a> {
+        Box::pin(async move {
+            let query: DuplicateQuery = serde_json::from_value(input.clone())
+                .map_err(|_| bilibi_agent_api::Error::Backend(bilibi_database::Error::Invalid))?;
+            let client = db()?.get().await.map_err(bilibi_database::Error::from)?;
+            let candidates = duplicates::duplicates(&**client, scope, &query).await?;
+            Ok(Output::Data(Data::Array(
+                candidates
+                    .iter()
+                    .map(|candidate| {
+                        Data::restricted(candidate.to_json(), &candidate.company.masked_fields())
+                    })
+                    .collect(),
+            )))
+        })
+    }
+}
+
+struct Hierarchy;
+impl ReadHandler for Hierarchy {
+    fn owner(&self) -> &'static str {
+        "core/company"
+    }
+    fn call<'a>(
+        &'a self,
+        _client: &'a dyn OperationClient,
+        scope: &'a Scope,
+        input: &'a Value,
+    ) -> OperationFuture<'a> {
+        Box::pin(async move {
+            let id = input["company_id"]
+                .as_i64()
+                .ok_or(bilibi_database::Error::Invalid)?;
+            let client = db()?.get().await.map_err(bilibi_database::Error::from)?;
+            let tree =
+                hierarchy::read(&**client, scope, id)
+                    .await
+                    .map_err(|error| match error {
+                        bilibi_database::Error::NotFound => bilibi_agent_api::Error::NotFound,
+                        other => other.into(),
+                    })?;
+            let value = serde_json::to_value(&tree)
+                .map_err(|_| bilibi_agent_api::Error::Backend(bilibi_database::Error::Internal))?;
+            Ok(Output::Data(Data::from(value)))
+        })
+    }
+}
+
 struct Create;
 impl WriteHandler for Create {
     fn owner(&self) -> &'static str {
@@ -144,9 +206,10 @@ impl WriteHandler for Create {
         Box::pin(async move {
             let new = parse(input)?;
             let client = db()?.get().await.map_err(bilibi_database::Error::from)?;
-            let company = organisation::preview(&**client, scope, &new)
+            let preview = organisation::preview(&**client, scope, &new)
                 .await?
                 .map_err(invalid)?;
+            let company = &preview.company;
             let fields = [
                 ("name", json!(company.name)),
                 ("code", json!(company.code)),
@@ -161,12 +224,35 @@ impl WriteHandler for Create {
                 ("phone", json!(company.phone)),
                 ("website", json!(company.website)),
             ];
-            let changes: Vec<Value> = fields
+            let mut changes: Vec<Value> = fields
                 .into_iter()
                 .filter(|(_, to)| !to.is_null() && to.as_str() != Some(""))
                 .map(|(field, to)| json!({"field":field,"from":null,"to":to}))
                 .collect();
-            Ok(json!({"summary":"Create company","changes":changes}).into())
+            if let Some(anyway) = new
+                .create_anyway
+                .as_ref()
+                .and_then(|a| duplicates::normalise(a).ok())
+            {
+                changes.push(json!({"field":"create_anyway","from":null,"to":anyway}));
+            }
+            // The existing companies this one looks like, for the person to
+            // review: reuse one, or create anyway with a reason.
+            let candidates: Vec<Value> = preview
+                .duplicates
+                .iter()
+                .map(|candidate| {
+                    let mut value = candidate.to_json();
+                    for field in candidate.company.masked_fields() {
+                        value[field.as_str()] = json!({"restricted": true});
+                    }
+                    value
+                })
+                .collect();
+            Ok(
+                json!({"summary":"Create company","changes":changes,"duplicates":candidates})
+                    .into(),
+            )
         })
     }
     fn commit<'a>(
@@ -211,6 +297,22 @@ fn list_schema() -> Value {
 fn get_schema() -> Value {
     json!({"type":"object","required":["company_id"],"properties":{"company_id":{"type":"integer","minimum":1}}})
 }
+fn duplicate_schema() -> Value {
+    json!({"type":"object","properties":{
+        "name":{"type":"string","maxLength":160},
+        "legal_name":text(),"registration_number":text(),"website":text(),
+        "email":{"type":"string","maxLength":254},
+        "phone":{"type":"string","maxLength":64},
+        "except_id":{"type":"integer","minimum":1,"description":"A company to leave out, such as the one being edited."},
+        "limit":{"type":"integer","minimum":1,"maximum":100}
+    }})
+}
+fn anyway_schema() -> Value {
+    json!({"type":"object","required":["candidate_ids","reason"],"description":"Create the company although it looks like existing ones. Name every candidate core.company.duplicates or the preview returned, and say why they are different organisations.","properties":{
+        "candidate_ids":{"type":"array","items":{"type":"integer","minimum":1}},
+        "reason":{"type":"string","maxLength":500}
+    }})
+}
 fn create_schema() -> Value {
     json!({"type":"object","required":["name"],"properties":{
         "name":{"type":"string","maxLength":160},
@@ -222,7 +324,8 @@ fn create_schema() -> Value {
         "website":text(),
         "status":{"type":"string","enum":INITIAL_STATUSES},
         "parent_id":{"type":"integer","minimum":1},
-        "legal_entity_type_id":{"type":"integer","minimum":1}
+        "legal_entity_type_id":{"type":"integer","minimum":1},
+        "create_anyway":anyway_schema()
     }})
 }
 fn list_output() -> Value {
@@ -234,12 +337,20 @@ fn get_output() -> Value {
 fn create_output() -> Value {
     json!({"type":"object","description":"Created company and its Bilibi URL."})
 }
+fn duplicate_output() -> Value {
+    json!({"type":"array","description":"Likely duplicates, best first: id, name, code, legal_name, status, archived, the visible contact facts, score from 0 to 1, matched facts (registration_number, website, email_domain, phone or name, each with its score) and path."})
+}
+fn hierarchy_output() -> Value {
+    json!({"type":"object","description":"company, ancestors (root first) and descendants (by level), each with id, parent_id, name, code, status and level (the parent is -1, a child 1); max_depth; truncated when more exist beyond the depth limit or 1,000 companies."})
+}
 
 inventory::submit! { Contribution::new(DEFINITIONS, "core/company.agent", Provenance { module: "core/company", source: file!(), line: line!() }, &Definitions {
     operations: &[
         Operation { key: "core.company.create", title: "Create a company", summary: "Create an organisation in your tenant after searching for an existing company.", keywords: &["add", "organisation", "business"], capability: CREATE, input: create_schema, output: create_output, handler: Handler::SafeWrite(&Create), channels: Channels::Every, step_up: &[] },
         Operation { key: "core.company.list", title: "List companies", summary: "Find companies of your tenant by name, code, legal name, email or jurisdiction, one page at a time, with the fields you may see.", keywords: &["find", "search", "browse", "organisation", "business", "firm"], capability: LIST, input: list_schema, output: list_output, handler: Handler::Read(&List), channels: Channels::Every, step_up: &[] },
         Operation { key: "core.company.get", title: "Read a company", summary: "One company of your tenant by id, with the fields you may see.", keywords: &["show", "detail", "organisation", "business", "firm"], capability: VIEW, input: get_schema, output: get_output, handler: Handler::Read(&Get), channels: Channels::Every, step_up: &[] },
+        Operation { key: "core.company.duplicates", title: "Find likely duplicate companies", summary: "Existing companies of your tenant that look like the one you are about to create, scored with the facts that matched: registration number, website, email domain, phone or a similar name. Includes archived companies. Proposes only; never merges.", keywords: &["duplicate", "match", "reuse", "existing", "organisation", "business"], capability: LIST, input: duplicate_schema, output: duplicate_output, handler: Handler::Read(&Duplicates), channels: Channels::Every, step_up: &[] },
+        Operation { key: "core.company.hierarchy", title: "Read a company tree", summary: "A company's parent chain and subsidiaries, within the tenant's depth limit.", keywords: &["parent", "subsidiary", "group", "tree", "organisation"], capability: VIEW, input: get_schema, output: hierarchy_output, handler: Handler::Read(&Hierarchy), channels: Channels::Every, step_up: &[] },
     ],
-    guides: &[Guide { key: "core.company", title: "Companies", summary: "What a company is in this tenant, and how to find, read and create one.", keywords: &["organisation", "business", "firm", "status"], capability: LIST, body:"Postal addresses are saved and linked through core.address, not a scalar field here. Search address or read guide core.address. Use core.address.company.list or core.address.person.list to find existing addresses; create_and_attach or attach links an office, billing or other address to its company or contact. A namecard flow can create the contact first and then attach the office address in a separate reviewed write.\n\nA company is an organisation recorded in your tenant. A company may have a parent company, and one company is the tenant's primary company.\n\nBefore creating, search by company name, legal name and email with core.company.list. Reuse the existing company rather than making a duplicate. Company roles are relationships, never legal entity types or access grants: a related company assigned vendor supplies the source company, and a company may hold customer and vendor roles at once as separate links. Discover core.company.relationship.* and core.company.relationship_role.* for list, read and reviewed writes (guide core.company.relationship). Contacts use core.affiliation.contact.create, never an HR employee record. A person's employer must exist as a company first: reuse it, or create it before recording the person. Use core.company.create through a dry run, local review and plan-code commit. A missing code is generated from the name and shown in the preview. Do not invent legal identifiers or a jurisdiction from a phone number; ask when the source is unclear.\n\nA company's status is one of pending, active, suspended or archived. Status changes only through the lifecycle actions on the company's page, never through an edit of its fields.\n\nTo find companies, call core.company.list with search words. To read one, call core.company.get with its id. A field an administrator restricted reads as {\"restricted\": true}: the company has a value there, and you may not see it." }],
+    guides: &[Guide { key: "core.company", title: "Companies", summary: "What a company is in this tenant, and how to find, read and create one.", keywords: &["organisation", "business", "firm", "status"], capability: LIST, body:"Postal addresses are saved and linked through core.address, not a scalar field here. Search address or read guide core.address. Use core.address.company.list or core.address.person.list to find existing addresses; create_and_attach or attach links an office, billing or other address to its company or contact. A namecard flow can create the contact first and then attach the office address in a separate reviewed write.\n\nA company is an organisation recorded in your tenant. A company may have a parent company, and one company is the tenant's primary company. core.company.hierarchy reads a company's parent chain and subsidiaries. A parent that would make a loop, or a tree deeper than the tenant's limit (10 levels unless an operator changed it), is refused on parent_id.\n\nBefore creating, call core.company.duplicates with every fact you have (name, legal name, registration number, website, email, phone). Each candidate has a score from 0 to 1 and the facts that matched; an archived candidate is marked. Reuse an existing company rather than making a duplicate. The create preview lists the same candidates under duplicates. Create a company that looks like existing ones only when the person confirms they are different organisations: send create_anyway with every candidate id and their reason. A tenant may require that reason, and then a create without it is refused on create_anyway. A public mail domain such as gmail.com never matches. Company roles are relationships, never legal entity types or access grants: a related company assigned vendor supplies the source company, and a company may hold customer and vendor roles at once as separate links. Discover core.company.relationship.* and core.company.relationship_role.* for list, read and reviewed writes (guide core.company.relationship). Contacts use core.affiliation.contact.create, never an HR employee record. A person's employer must exist as a company first: reuse it, or create it before recording the person. Use core.company.create through a dry run, local review and plan-code commit. A missing code is generated from the name and shown in the preview. Do not invent legal identifiers or a jurisdiction from a phone number; ask when the source is unclear.\n\nA company's status is one of pending, active, suspended or archived. Status changes only through the lifecycle actions on the company's page, never through an edit of its fields.\n\nTo find companies, call core.company.list with search words. To read one, call core.company.get with its id. A field an administrator restricted reads as {\"restricted\": true}: the company has a value there, and you may not see it." }],
 }) }

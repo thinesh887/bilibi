@@ -1,5 +1,8 @@
 //! Company page read models and audited writes missing from the original slice.
-use crate::{organisation, CompanyService, CreateOutcome, Edit, NewCompany, UPDATE};
+use crate::{
+    hierarchy, organisation, policy::Policy, CompanyService, CreateOutcome, Edit, NewCompany,
+    WriteError, UPDATE,
+};
 use bilibi_database::{Change, Error, Result};
 use bilibi_tenancy::Scope;
 use serde_json::{json, Value};
@@ -23,6 +26,8 @@ impl CompanyService {
             .begin(&mut client, scope.mutation_context("company.create"))
             .await?;
         if let Some(parent) = new.parent_id {
+            // The tree lock comes before the parent row, as a parent change takes it.
+            organisation::lock_tree(tx.sql(), scope.tenant()).await?;
             organisation::authorize_target(tx.sql(), scope, parent, crate::CREATE).await?;
             organisation::require_writable(tx.sql(), scope, parent, true)
                 .await
@@ -43,7 +48,16 @@ impl CompanyService {
         Ok(result)
     }
 
-    pub async fn save_fact(&self, scope: &Scope, credential: &str, edit: &Edit) -> Result<()> {
+    /// Saves one fact of the detail page. A parent that would make a loop or
+    /// a tree deeper than the tenant's limit is `WriteError::Invalid` with the
+    /// `parent_id` error that says so; every other refusal is the `Error` the
+    /// page already words.
+    pub async fn save_fact(
+        &self,
+        scope: &Scope,
+        credential: &str,
+        edit: &Edit,
+    ) -> std::result::Result<(), WriteError> {
         if ![
             "parent_id",
             "legal_entity_type_id",
@@ -52,9 +66,9 @@ impl CompanyService {
         ]
         .contains(&edit.field.as_str())
         {
-            return self.save(credential, edit).await;
+            return Ok(self.save(credential, edit).await?);
         }
-        let mut client = self.db.get().await?;
+        let mut client = self.db.get().await.map_err(Error::from)?;
         let mut tx = self
             .mutations
             .begin(&mut client, scope.mutation_context("company.update"))
@@ -64,12 +78,7 @@ impl CompanyService {
         // Otherwise two concurrent A→B / B→A changes could both pass the
         // ancestor check against an uncommitted snapshot.
         if edit.field == "parent_id" {
-            tx.sql()
-                .query_one(
-                    "SELECT id FROM tenants WHERE id=$1 FOR NO KEY UPDATE",
-                    &[&scope.tenant()],
-                )
-                .await?;
+            organisation::lock_tree(tx.sql(), scope.tenant()).await?;
         }
         organisation::require_writable(tx.sql(), scope, edit.id, true)
             .await
@@ -83,9 +92,10 @@ impl CompanyService {
                 "SELECT version FROM companies WHERE tenant_id=$1 AND id=$2",
                 &[&scope.tenant(), &edit.id],
             )
-            .await?;
+            .await
+            .map_err(Error::from)?;
         if row.get::<_, i64>(0) != edit.version {
-            return Err(Error::Conflict);
+            return Err(Error::Conflict.into());
         }
         let value = if ["metadata", "scope_activities"].contains(&edit.field.as_str()) {
             if edit.value.trim().is_empty() {
@@ -98,7 +108,7 @@ impl CompanyService {
                             .as_array()
                             .is_some_and(|a| a.iter().all(Value::is_string))))
                 {
-                    return Err(Error::Invalid);
+                    return Err(Error::Invalid.into());
                 }
                 value
             }
@@ -110,16 +120,24 @@ impl CompanyService {
             };
             if let Some(id) = id {
                 if id <= 0 {
-                    return Err(Error::Invalid);
+                    return Err(Error::Invalid.into());
                 }
                 if edit.field == "parent_id" {
                     organisation::authorize_target(tx.sql(), scope, id, UPDATE).await?;
                     organisation::require_writable(tx.sql(), scope, id, true)
                         .await
                         .map_err(write_error)?;
-                    let cycle: bool = tx.sql().query_one("WITH RECURSIVE ancestors AS (SELECT id,parent_id FROM companies WHERE tenant_id=$1 AND id=$2 UNION SELECT c.id,c.parent_id FROM companies c JOIN ancestors a ON c.id=a.parent_id WHERE c.tenant_id=$1) SELECT EXISTS(SELECT 1 FROM ancestors WHERE id=$3)", &[&scope.tenant(),&id,&edit.id]).await?.get(0);
-                    if cycle {
-                        return Err(Error::Invalid);
+                    let max_depth = Policy::read(tx.sql(), scope).await?.max_depth;
+                    if let Some(error) = hierarchy::check_parent(
+                        tx.sql(),
+                        scope.tenant(),
+                        Some(edit.id),
+                        id,
+                        max_depth,
+                    )
+                    .await?
+                    {
+                        return Err(WriteError::Invalid(vec![error]));
                     }
                 } else if tx
                     .sql()
@@ -127,10 +145,11 @@ impl CompanyService {
                         "SELECT id FROM company_legal_entity_types WHERE id=$1",
                         &[&id],
                     )
-                    .await?
+                    .await
+                    .map_err(Error::from)?
                     .is_none()
                 {
-                    return Err(Error::Invalid);
+                    return Err(Error::Invalid.into());
                 }
             }
             json!(id)
@@ -147,7 +166,7 @@ impl CompanyService {
             }
             Ok(((),vec![Change {kind:"company".into(),id,old:json!({&field:old}),new:json!({&field:value})}]))
         })).await?;
-        tx.commit().await
+        Ok(tx.commit().await?)
     }
 }
 

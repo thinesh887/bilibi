@@ -5,7 +5,10 @@
 //! `core/party`'s `OWNERSHIP`: the `OrganisationId` of a company is its row id,
 //! so every existing id and `/companies/{id}` URL is kept.
 use crate::{
-    contributions::{CREATE, TENANT_WIDE},
+    contributions::{CREATE, LIST, TENANT_WIDE},
+    duplicates::{self, Candidate, CreateAnyway},
+    hierarchy,
+    policy::Policy,
     Company, FieldError, WriteError, MASK,
 };
 use bilibi_authz::{authorize_key, authorize_proof, decide_proof, restrictions};
@@ -365,7 +368,7 @@ fn push_separated(slug: &mut String, separator: &mut bool) {
     *separator = false;
 }
 /// Latin-1 and Latin Extended-A letters to their base letter; others unchanged.
-fn strip_accent(ch: char) -> char {
+pub(crate) fn strip_accent(ch: char) -> char {
     const TABLE: &[(&str, char)] = &[
         ("ÀÁÂÃÄÅĀĂĄ", 'A'),
         ("àáâãäåāăą", 'a'),
@@ -430,6 +433,9 @@ pub struct NewCompany {
     pub email: Option<String>,
     pub phone: Option<String>,
     pub website: Option<String>,
+    /// Creates the company although it looks like existing ones, for the
+    /// reason given (issue 139). Kept in the create's audit change.
+    pub create_anyway: Option<CreateAnyway>,
 }
 /// A create that passed its own validation: trimmed, defaulted, with a code.
 /// Reference facts (parent, legal entity type, jurisdiction, code uniqueness)
@@ -686,10 +692,73 @@ pub enum CreateOutcome {
     Refused(Vec<FieldError>),
 }
 
+/// Serializes a parent's tree within the tenant for the rest of the
+/// transaction, before any other lock, as a parent change does: the parent
+/// checks then see every committed move.
+pub(crate) async fn lock_tree(client: &impl GenericClient, tenant: i64) -> Result<()> {
+    client
+        .query_one(
+            "SELECT id FROM tenants WHERE id=$1 FOR NO KEY UPDATE",
+            &[&tenant],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The checks a create runs after its own validation and reference facts:
+/// the parent's tree depth, the create-anyway's shape and, when the tenant
+/// requires a reason, the duplicate candidates. Returns the field errors and
+/// the normalised create-anyway.
+async fn check_create(
+    client: &(impl GenericClient + Sync),
+    scope: &Scope,
+    policy: &Policy,
+    new: &NewCompany,
+    company: &ValidCompany,
+    restricted: &HashSet<String>,
+) -> Result<(Vec<FieldError>, Option<CreateAnyway>)> {
+    let mut errors = Vec::new();
+    if let Some(parent) = company.parent_id {
+        errors.extend(
+            hierarchy::check_parent(client, scope.tenant(), None, parent, policy.max_depth).await?,
+        );
+    }
+    let anyway = match new.create_anyway.as_ref().map(duplicates::normalise) {
+        Some(Ok(anyway)) => Some(anyway),
+        Some(Err(error)) => {
+            errors.push(error);
+            None
+        }
+        None => None,
+    };
+    // A malformed create-anyway is already refused; the candidates are
+    // looked up only when its reason could still decide the create.
+    if policy.require_reason && (new.create_anyway.is_none() || anyway.is_some()) {
+        let candidates =
+            duplicates::for_company(client, scope, policy, company, restricted).await?;
+        let can_list = decide(client, scope, LIST).await?;
+        errors.extend(duplicates::reason_missing(
+            &candidates,
+            anyway.as_ref(),
+            can_list,
+        ));
+    }
+    Ok((errors, anyway))
+}
+async fn decide(client: &impl GenericClient, scope: &Scope, key: &str) -> Result<bool> {
+    match authorize_key(client, scope, key).await {
+        Ok(()) => Ok(true),
+        Err(Error::Forbidden) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Creates a company under the scope's tenant as an audited mutation
 /// (Bilimbi `create_company/3`): `admin.company.create` now, the actor's
 /// field restrictions, the reference facts on this transaction, one
-/// `company` change. Shares the caller's transaction; never commits it.
+/// `company` change. A parent takes the tenant's tree lock first; a tenant
+/// that requires a reason rechecks the duplicates under a lock on the
+/// normalised name. Shares the caller's transaction; never commits it.
 pub async fn create(
     tx: &mut MutationTransaction<'_>,
     scope: &Scope,
@@ -702,20 +771,44 @@ pub async fn create(
         Err(errors) => return Ok(CreateOutcome::Refused(errors)),
     };
     let tenant = scope.tenant();
-    lock_code(tx.sql(), tenant, &company.code).await?;
-    let errors = check_references(tx.sql(), tenant, &company, None).await?;
-    if !errors.is_empty() {
-        return Ok(CreateOutcome::Refused(errors));
+    let policy = Policy::read(tx.sql(), scope).await?;
+    if company.parent_id.is_some() {
+        lock_tree(tx.sql(), tenant).await?;
     }
+    lock_code(tx.sql(), tenant, &company.code).await?;
+    if policy.require_reason {
+        duplicates::lock_name(tx.sql(), tenant, &policy, &company.name).await?;
+    }
+    let mut errors = check_references(tx.sql(), tenant, &company, None).await?;
+    if errors.is_empty() {
+        let (more, anyway) =
+            check_create(tx.sql(), scope, &policy, new, &company, &restricted).await?;
+        errors.extend(more);
+        if errors.is_empty() {
+            return insert_audited(tx, tenant, company, anyway).await;
+        }
+    }
+    Ok(CreateOutcome::Refused(errors))
+}
+async fn insert_audited(
+    tx: &mut MutationTransaction<'_>,
+    tenant: i64,
+    company: ValidCompany,
+    anyway: Option<CreateAnyway>,
+) -> Result<CreateOutcome> {
     let created = tx
         .mutate(move |sql| {
             Box::pin(async move {
                 let created = insert(sql, tenant, &company).await?;
+                let mut new = created.to_json();
+                if let Some(anyway) = anyway {
+                    new["create_anyway"] = json!(anyway);
+                }
                 let change = Change {
                     kind: "company".into(),
                     id: created.id,
                     old: serde_json::Value::Null,
-                    new: created.to_json(),
+                    new,
                 };
                 Ok((created, vec![change]))
             })
@@ -724,26 +817,48 @@ pub async fn create(
     Ok(CreateOutcome::Created(Box::new(created)))
 }
 
+/// What a create would write, and the existing companies it looks like.
+pub struct Preview {
+    pub company: ValidCompany,
+    /// Empty for a reader without `admin.company.list`.
+    pub duplicates: Vec<Candidate>,
+}
 /// Validates a prospective company, including generated defaults, field
-/// access and current code uniqueness, without writing or reserving the code
-/// (Bilimbi `preview_create_company/2`).
+/// access, current code uniqueness, the parent's tree depth and the duplicate
+/// rule, without writing or reserving the code (Bilimbi
+/// `preview_create_company/2`).
 pub async fn preview(
-    client: &impl GenericClient,
+    client: &(impl GenericClient + Sync),
     scope: &Scope,
     new: &NewCompany,
-) -> Result<std::result::Result<ValidCompany, Vec<FieldError>>> {
+) -> Result<std::result::Result<Preview, Vec<FieldError>>> {
     authorize_key(client, scope, CREATE).await?;
     let restricted = restrictions(client, scope).await?;
     let company = match validate(new, &restricted) {
         Ok(company) => company,
         Err(errors) => return Ok(Err(errors)),
     };
-    let errors = check_references(client, scope.tenant(), &company, None).await?;
-    Ok(if errors.is_empty() {
-        Ok(company)
+    let mut errors = check_references(client, scope.tenant(), &company, None).await?;
+    let policy = Policy::read(client, scope).await?;
+    if errors.is_empty() {
+        errors.extend(
+            check_create(client, scope, &policy, new, &company, &restricted)
+                .await?
+                .0,
+        );
+    }
+    if !errors.is_empty() {
+        return Ok(Err(errors));
+    }
+    let duplicates = if decide(client, scope, LIST).await? {
+        duplicates::for_company(client, scope, &policy, &company, &restricted).await?
     } else {
-        Err(errors)
-    })
+        Vec::new()
+    };
+    Ok(Ok(Preview {
+        company,
+        duplicates,
+    }))
 }
 
 /// One bounded page of the administration index (Bilimbi

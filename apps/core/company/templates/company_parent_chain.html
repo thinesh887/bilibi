@@ -1,0 +1,3 @@
+{# A company's parent chain (issue 139), root first; an ellipsis stands for
+   levels above the tenant's tree depth limit. #}
+<nav id="company-parent-chain" aria-label="Parent chain" class="flex flex-wrap items-center gap-x-1.5 gap-y-1">{% if truncated %}<span class="text-ink-muted" title="More levels above">…</span><span aria-hidden="true" class="text-ink-faint">›</span>{% endif %}{% for link in links %}{{ link }}<span aria-hidden="true" class="text-ink-faint">›</span>{% endfor %}<span aria-current="page" class="text-ink-muted">{{ name }}</span></nav>

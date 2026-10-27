@@ -5,11 +5,14 @@
 mod agent_operations;
 mod contributions;
 mod departments;
+mod duplicates;
 mod eligibility;
 mod files;
+mod hierarchy;
 mod lifecycle;
 mod organisation;
 mod page_data;
+mod policy;
 mod tenant_provisioning;
 pub use tenant_provisioning::TenantCompanyErrors;
 mod primary;
@@ -31,7 +34,12 @@ pub use eligibility::{
     account_eligibility, lock_account_company, lock_account_company_in, lock_writable_companies,
     AccountEligibility,
 };
+// Duplicate candidates and the reason a create goes ahead anyway (issue 139).
+pub use duplicates::{
+    Candidate as DuplicateCandidate, CreateAnyway, DuplicateQuery, Matched as DuplicateMatch,
+};
 pub use files::{CompanyFiles, ARTIFACT_OWNER, ATTACHMENT_SUBJECT, FILES};
+pub use hierarchy::{Hierarchy, HierarchyNode};
 // A transition on another owner's transaction, and what it offers or refuses.
 pub use lifecycle::{
     apply as apply_lifecycle, operations_from as lifecycle_operations, LifecycleError,
@@ -89,6 +97,11 @@ pub const MIGRATION_ROLE_OWNER: (&str, &str) = (
 pub const MIGRATION_SEARCH: (&str, &str) = (
     "core-company-007-search",
     include_str!("../migrations/007-search.sql"),
+);
+/// Issue 139: the normalised keys duplicate candidates are matched on.
+pub const MIGRATION_MATCH_KEYS: (&str, &str) = (
+    "core-company-008-match-keys",
+    include_str!("../migrations/008-match-keys.sql"),
 );
 pub const MASK: &str = "••••";
 /// The registry service id of the Companies facade.
@@ -438,6 +451,22 @@ impl CompanyService {
         )
         .await
     }
+    /// The existing companies a new or edited one looks like, best first
+    /// (`admin.company.list`). It proposes and never chooses or merges.
+    pub async fn duplicates(
+        &self,
+        scope: &Scope,
+        query: &DuplicateQuery,
+    ) -> Result<Vec<DuplicateCandidate>> {
+        let client = self.db.get().await?;
+        duplicates::duplicates(&**client, scope, query).await
+    }
+    /// A company's ancestors and descendants within the tenant's depth limit
+    /// (`admin.company.view`).
+    pub async fn hierarchy(&self, scope: &Scope, id: i64) -> Result<Hierarchy> {
+        let client = self.db.get().await?;
+        hierarchy::read(&**client, scope, id).await
+    }
     /// `create_company/3`: a refused create rolls back and reports its fields.
     pub async fn create_company(&self, scope: &Scope, new: &NewCompany) -> Result<CreateOutcome> {
         let mut client = self.db.get().await.map_err(Error::from)?;
@@ -715,8 +744,8 @@ async fn finish(tx: bilibi_database::MutationTransaction<'_>, saved: bool) -> Re
 inventory::submit! {
     bilibi_module_registry::Module {
         id:"core/company",layer:bilibi_module_registry::Layer::Core,
-        dependencies:&["base/database","base/security","base/ui","base/notifications","base/party_ids","base/session","base/menu","base/grid","base/search","base/dashboard","base/authz","base/tenancy","base/audit","base/agent_api","base/datetime","base/locale","base/principal_directory","base/media","base/artifacts","base/picklists","core/party","core/geonames","core/person"],
-        migrations:&[MIGRATION, MIGRATION_ORGANISATION, MIGRATION_RELATIONSHIPS, MIGRATION_ROLE_OWNER, MIGRATION_SEARCH],
+        dependencies:&["base/database","base/security","base/ui","base/notifications","base/party_ids","base/session","base/menu","base/grid","base/search","base/dashboard","base/authz","base/tenancy","base/audit","base/agent_api","base/datetime","base/locale","base/principal_directory","base/media","base/artifacts","base/picklists","base/settings","core/party","core/geonames","core/person"],
+        migrations:&[MIGRATION, MIGRATION_ORGANISATION, MIGRATION_RELATIONSHIPS, MIGRATION_ROLE_OWNER, MIGRATION_SEARCH, MIGRATION_MATCH_KEYS],
         services: &[
             bilibi_module_registry::Service { id: SERVICE, factory: |services| {
                 let db = services.get::<Db>("base/database.pool")?.as_ref().clone();
@@ -727,6 +756,7 @@ inventory::submit! {
                 proofs.bind_directory(Arc::new(organisation::Directory))?;
                 let directory = services.get::<bilibi_principal_directory::PrincipalDirectory>("base/principal_directory.directory")?;
                 agent_operations::bind(db.clone())?;
+                policy::bind(services.get("base/settings.store")?)?;
                 relationship_operations::bind(db.clone(), proofs.clone(), directory.clone())?;
                 Ok(Arc::new(CompanyService {
                     sessions: services.get("base/session.sessions")?, mutations: services.get("base/database.mutations")?,

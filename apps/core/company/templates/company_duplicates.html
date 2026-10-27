@@ -1,0 +1,4 @@
+{# The likely duplicates under Create Company (issue 139): each row names the
+   company, its status, the facts that matched and its score, and opens it. #}
+{{ notice }}
+<ul id="company-duplicate-list" class="mt-3 divide-y divide-line">{% for row in rows %}<li id="company-duplicate-{{ row.id }}" class="flex flex-wrap items-center gap-x-3 gap-y-1 py-2"><span class="min-w-0"><span class="font-medium text-ink">{{ row.name }}</span> <span class="text-ink-muted">{{ row.detail }}</span></span>{{ row.badge }}<span class="text-ink-muted">{{ row.matched }}</span><span class="ml-auto tabular-nums text-ink-muted" title="Match score from 0 to 1">{{ row.score }}</span>{{ row.open }}</li>{% endfor %}</ul>

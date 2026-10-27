@@ -1,6 +1,6 @@
 use super::fields;
 use super::Pending;
-use crate::{Company, FieldError, NewCompany, Params};
+use crate::{Company, DuplicateCandidate, FieldError, NewCompany, Params};
 use askama::Template;
 use bilibi_database::{Error, Result};
 use bilibi_grid::{PageColumns, PageViews};
@@ -412,6 +412,43 @@ fn choice(
     })
 }
 #[derive(Template)]
+#[template(path = "company_parent_chain.html")]
+struct ParentChain {
+    links: Vec<Html>,
+    name: String,
+    truncated: bool,
+}
+/// The company's ancestors, root first, as links to their records (issue
+/// 139), ending with the company itself.
+async fn parent_chain(
+    client: &(impl GenericClient + Sync),
+    scope: &Scope,
+    company: &Company,
+    workspace: bool,
+) -> Result<Html> {
+    let max_depth = crate::policy::Policy::read(client, scope).await?.max_depth;
+    let (ancestors, truncated) =
+        crate::hierarchy::ancestors(client, scope.tenant(), company.id, max_depth).await?;
+    let mut links = Vec::new();
+    for ancestor in &ancestors {
+        let key = ancestor.id.to_string();
+        let href = format!("/companies/{key}");
+        links.push(render(&RecordLink {
+            workspace,
+            kind: "core/company",
+            record_id: &key,
+            href: &href,
+            class: "text-link hover:underline",
+            body: Html::text(&ancestor.name),
+        })?);
+    }
+    render(&ParentChain {
+        links,
+        name: company.name.clone(),
+        truncated,
+    })
+}
+#[derive(Template)]
 #[template(path = "detail.html")]
 struct DetailBody<'a> {
     id: i64,
@@ -637,6 +674,13 @@ pub(super) async fn detail(
             editable,
         )?,
     });
+    if company.parent_id.is_some() {
+        facts.push(Fact {
+            title: "Parent Chain",
+            id: "detail-parent-chain",
+            value: parent_chain(client, scope, &company, workspace).await?,
+        });
+    }
     let context = client
         .query_one(
             "SELECT scope_activities,metadata FROM companies WHERE tenant_id=$1 AND id=$2",
@@ -946,14 +990,192 @@ struct CreateBody {
     fields: Vec<Html>,
     contacts: Vec<Html>,
     context: Vec<Html>,
+    duplicates: Html,
     submit: Html,
+    modal: Html,
+}
+/// One likely duplicate under the create form.
+struct DuplicateRow {
+    id: i64,
+    name: String,
+    detail: String,
+    badge: Html,
+    matched: String,
+    score: String,
+    open: Html,
+}
+#[derive(Template)]
+#[template(path = "company_duplicates.html")]
+struct DuplicateList {
+    notice: Html,
+    rows: Vec<DuplicateRow>,
+}
+fn matched_label(fact: &str) -> &'static str {
+    match fact {
+        "registration_number" => "Same registration number",
+        "website" => "Same website",
+        "email_domain" => "Same email domain",
+        "phone" => "Same phone number",
+        _ => "Similar name",
+    }
+}
+/// The likely duplicates of the draft (issue 139): each opens the existing
+/// record, and Create anyway asks for the reason. A refusal on the reason
+/// that no dialog can answer (the reader cannot list companies) shows here.
+fn duplicate_section(candidates: &[DuplicateCandidate], errors: &[FieldError]) -> Result<Html> {
+    let refusals: Vec<String> = errors
+        .iter()
+        .filter(|error| error.field == "create_anyway")
+        .map(|error| error_sentence("This company", &error.message))
+        .collect();
+    let notice = if refusals.is_empty() {
+        Html::EMPTY
+    } else {
+        render(&Alert {
+            kind: StatusKind::Error,
+            id: "company-duplicates-refused",
+            class: "mb-4",
+            body: Html::text(&refusals.join(" ")),
+        })?
+    };
+    if candidates.is_empty() {
+        return Ok(notice);
+    }
+    let mut rows = Vec::new();
+    for candidate in candidates {
+        let company = &candidate.company;
+        let href = format!("/companies/{}", company.id);
+        let open_id = format!("company-duplicate-{}-open", company.id);
+        rows.push(DuplicateRow {
+            id: company.id,
+            name: company.name.clone(),
+            detail: company
+                .legal_name
+                .clone()
+                .filter(|legal| *legal != company.name)
+                .unwrap_or_else(|| company.code.clone()),
+            badge: badge(&company.status)?,
+            matched: candidate
+                .matched
+                .iter()
+                .map(|fact| matched_label(fact.fact))
+                .collect::<Vec<_>>()
+                .join(" · "),
+            score: format!("{:.2}", candidate.score),
+            open: render(&ActionLink {
+                id: &open_id,
+                icon: "",
+                title: &format!("Use existing company {}", company.name),
+                href: &href,
+                body: Html::text("Use existing"),
+                ..ActionLink::default()
+            })?,
+        });
+    }
+    let mut body = render(&SectionHeading {
+        id: "company-duplicates-heading",
+        title: "Possible existing companies",
+        count: Some(rows.len()),
+        description:
+            "This company looks like these. Use an existing one, or create it anyway with a reason.",
+        actions: render(&Button {
+            id: "company-create-anyway",
+            button_type: "button",
+            event: "request_create_anyway",
+            body: Html::text("Create anyway"),
+            ..Button::default()
+        })?,
+        ..SectionHeading::default()
+    })?;
+    body.push(&render(&DuplicateList { notice, rows })?);
+    render(&Card {
+        id: "company-duplicates",
+        inner_class: "p-5 sm:p-6",
+        role: "region",
+        labelledby: "company-duplicates-heading",
+        body,
+        ..Card::default()
+    })
+}
+/// Create anyway: the reason, recorded with the candidates reviewed.
+fn anyway_dialog(values: &HashMap<String, String>, anyway: &super::Anyway) -> Result<Html> {
+    let name = values
+        .get("name")
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("This company");
+    let count = anyway.candidate_ids.len();
+    let title = format!(
+        "{name} will be created although it looks like {count} existing {}.",
+        if count == 1 { "company" } else { "companies" }
+    );
+    let mut reason = Field::named("reason")
+        .id("company-create-anyway-reason")
+        .label("Reason")
+        .hint("Why this is a different organisation. Kept in the audit trail with the companies you reviewed.")
+        .kind(InputKind::Textarea)
+        .value(&anyway.reason)
+        .required()
+        .attr("maxlength", "500")
+        .errors(if anyway.error.is_empty() {
+            vec![]
+        } else {
+            vec![anyway.error.clone()]
+        });
+    reason.attrs.autofocus = true;
+    let mut actions = render(&Button {
+        id: "company-create-anyway-cancel",
+        event: "cancel_create_anyway",
+        button_type: "button",
+        body: Html::text("Cancel"),
+        ..Button::default()
+    })?;
+    actions.push(&render(&Button {
+        id: "company-create-anyway-confirm",
+        button_type: "submit",
+        variant: ButtonVariant::Primary,
+        working: "Creating…",
+        body: Html::text("Create anyway"),
+        ..Button::default()
+    })?);
+    render(&Modal {
+        id: "company-create-anyway-modal",
+        title: &title,
+        description: if anyway.required {
+            "This workspace asks for a reason before creating a company that looks like an existing one."
+        } else {
+            "Check the companies listed under the form first: using an existing one keeps its history in one place."
+        },
+        cancel_event: "cancel_create_anyway",
+        role: "alertdialog",
+        body: render(&Form {
+            id: "company-create-anyway-form",
+            event: "confirm_create_anyway",
+            class: "mt-4",
+            body: render(&reason)?,
+            actions,
+            ..Form::default()
+        })?,
+        ..Modal::default()
+    })
+}
+pub(super) struct CreateState<'a> {
+    pub values: &'a HashMap<String, String>,
+    pub errors: &'a [FieldError],
+    pub candidates: &'a [DuplicateCandidate],
+    pub anyway: Option<&'a super::Anyway>,
 }
 pub(super) async fn create(
     client: &impl GenericClient,
     scope: &Scope,
-    values: &HashMap<String, String>,
-    errors: &[FieldError],
+    state: CreateState<'_>,
 ) -> Result<String> {
+    let CreateState {
+        values,
+        errors,
+        candidates,
+        anyway,
+    } = state;
     bilibi_authz::authorize_key(client, scope, crate::CREATE).await?;
     let masked = bilibi_authz::restrictions(client, scope).await?;
     let opts = options(client, scope, None, true).await?;
@@ -1006,6 +1228,18 @@ pub(super) async fn create(
             );
         if ["name", "status"].contains(&name) {
             field = field.required();
+        }
+        // The facts duplicates match on are checked as the person types.
+        if [
+            "name",
+            "legal_name",
+            "registration_number",
+            "email",
+            "website",
+        ]
+        .contains(&name)
+        {
+            field = field.attr("data-debounce", "400");
         }
         field = match name {
             "parent_id" => field.prompt("None").options(opts.parents.clone()),
@@ -1079,7 +1313,12 @@ pub(super) async fn create(
             fields,
             contacts,
             context,
+            duplicates: duplicate_section(candidates, errors)?,
             submit,
+            modal: match anyway {
+                Some(anyway) => anyway_dialog(values, anyway)?,
+                None => Html::EMPTY,
+            },
         })?,
     )
 }
