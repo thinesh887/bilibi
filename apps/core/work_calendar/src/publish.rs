@@ -108,11 +108,11 @@ impl WorkCalendars {
             .map(|row| row.get(0))
             .collect();
         let mut failed = 0;
+        let mut fenced = self.db.get().await?;
         for tenant in tenants {
             // Queue's fence: the job's row stays locked while this tenant's
             // transaction commits, so a cancelled, expired or replaced claim
             // tells nobody more. It writes nothing and rolls back on drop.
-            let mut fenced = self.db.get().await?;
             let _fence = execution.begin(&mut fenced, HANDLER).await?;
             // One tenant failing keeps no other waiting: the retry tells it.
             if self.tell(&mut client, tenant, publication).await.is_err() {
