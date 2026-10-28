@@ -41,4 +41,4 @@
 
 - Installation-wide holiday sets cross tenants on purpose, each statement commented in the code: any tenant reads (and, to include or copy one, share-locks) the operator's installation-wide rows; the operator's writes check a new installation-wide code against every tenant's, count the other tenants' calendars a change tells, and the job finds the tenants to tell. Every other statement keeps the tenant predicate (the module README lists them).
 - A tenant hears of an installation-wide change shortly after it commits, not in the same transaction. A tenant that denies `work-calendar-publisher`, or is suspended, is not told.
-- Pages, the month view and a day-type tile in `base/ui` follow in [#209](https://github.com/BelimbingApp/bilibi/issues/209); the contracts they will call exist now.
+- The pages ([#209](https://github.com/BelimbingApp/bilibi/issues/209)) write only through the contracts. The day tile and month grid are `base/ui` primitives with their own `day-*` colour roles, so a Domain's roster or leave calendar shows day types the same way.

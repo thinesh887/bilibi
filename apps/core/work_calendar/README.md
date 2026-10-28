@@ -80,7 +80,7 @@ Tenant capabilities `admin.work-calendar.view`, `.list` and `.manage`; the `tena
 - **One plan, one version.** Each operation of a reviewed plan names the version read before the plan, and the commit fences each against it, so one plan may write a calendar or set several times. A change committed elsewhere since the review is still refused as stale.
 - **Bounded reads.** Lists page (`page`, `page_size` at most 100) with the total. A calendar's rule versions and included sets, and a set's including calendars, come as the first 400 with the total; exceptions and holidays page 400 at a time (`page`).
 
-Agents, and later the pages, use these contracts (ADR 01); writes are reviewed (plan, then commit):
+Agents and the [pages](#pages) use these contracts (ADR 01); writes are reviewed (plan, then commit):
 
 | Operation | Kind | Does |
 | --- | --- | --- |
@@ -122,9 +122,24 @@ A holiday change to an installation-wide set records `changed` for the operator'
 - A tenant that denies the principal, or is suspended, is told nothing; its calendars still read the new holidays at once, since the event only tells modules that keep computed results to recompute.
 - Renaming an installation-wide set, or changing its country, moves no date and tells nobody.
 
+## Pages
+
+Administration › Work calendars holds **Calendars** and **Holiday sets**; the menu and both lists need `admin.work-calendar.list`, a record and its month `.view`. Every write is a contract above, declared in the module's page writes (`core/work_calendar.pages`), so a page changes nothing an agent could not. Controls the reader may not use are hidden.
+
+| Page | Path | Shows |
+| --- | --- | --- |
+| Calendars | `/admin/work-calendars` | Code, name, status, time zone in force and included sets (`FlexTable`; Grid table `work_calendars`). A new calendar starts in the current company's `localization.timezone` and opens on its page |
+| Calendar | `/admin/work-calendars/{code}` | Name and substitute rule edited in place; rule versions with "Set the week from a date"; included sets with include and leave out; exceptions with add and remove. Retire and removing an exception confirm |
+| Month | `/admin/work-calendars/{code}/month?month=2026-11` | Each date as a day tile (`base/ui` `DayTile`): type, hours and why. The previous and next months are links |
+| Holiday sets | `/admin/holiday-sets` | The tenant's sets and the installation-wide ones, with who keeps each |
+| Holiday set | `/admin/holiday-sets/{code}?year=2026` | Name, country and division edited in place; one year's holidays with add, rename in place and remove (confirmed); the reader's calendars that include it. An installation-wide set is read-only except to the operator, and "Copy into a new set" makes one the reader keeps |
+
+- Every write names the version the page read. The host refreshes a page when another session changes the tenant's records, so a stale write is one that lands before that refresh; it is refused with "Reload the page".
+- A refused form keeps its dialog open with each reason on its field.
+
 ## Not here
 
-Shifts, rosters and attendance; pay rates by day type and leave-day counting; SLA, voice-menu and routing logic; holiday feeds, file import and iCalendar; per-person calendars; meeting and booking calendars. Calendar pages, the month view and the day-type tile come in a later change ([#209](https://github.com/BelimbingApp/bilibi/issues/209)).
+Shifts, rosters and attendance; pay rates by day type and leave-day counting; SLA, voice-menu and routing logic; holiday feeds, file import and iCalendar; per-person calendars; meeting and booking calendars.
 
 ## Walkthrough
 

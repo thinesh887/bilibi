@@ -11,12 +11,14 @@
 //! Installation-wide holiday sets (issue 210) are the platform operator's:
 //! every tenant includes them, and the `publish` job tells each one of a
 //! change.
+//! The administration pages (issue 209) are in `web`.
 mod agent_operations;
 mod model;
 mod publish;
 mod resolve;
 mod store;
 mod timetable;
+mod web;
 
 pub use model::{
     Calendar, CalendarEntry, Choice, Day, DayType, Exception, FieldError, Holiday, HolidaySet,
@@ -33,7 +35,11 @@ use bilibi_authz::{
 use bilibi_database::{Db, Error, MutationBoundary, Result};
 use bilibi_events::{EventType, Events, EVENTS};
 use bilibi_geonames::Geonames;
-use bilibi_module_registry::{Contribution, Service};
+use bilibi_grid::{Field, FieldType, GridContribution, Source, TableDecl};
+use bilibi_module_registry::{
+    contributions::{Access, Method, PageWrites, Pending, Route, PAGE_WRITES, ROUTES},
+    Contribution, Service,
+};
 use bilibi_party_ids::OrganisationId;
 use bilibi_queue::{
     execution::{HandlerBinding, HandlerService, HANDLERS},
@@ -163,6 +169,41 @@ impl WorkCalendars {
         authorize_key(&**client, &scope, LIST).await?;
         store::calendars(&**client, scope.tenant(), listing).await
     }
+    /// The calendars page's rows: [`Self::calendars`] with each calendar's
+    /// zone in force and included sets. Needs `admin.work-calendar.list`.
+    pub(crate) async fn calendar_index(
+        &self,
+        scope: &Scope,
+        listing: &Listing,
+    ) -> Result<Rows<store::IndexRow>> {
+        let client = self.db.get().await?;
+        let scope = self.authentication.reprove(&**client, scope).await?;
+        authorize_key(&**client, &scope, LIST).await?;
+        store::index(&**client, scope.tenant(), listing).await
+    }
+    /// The current company's `localization.timezone`, else the tenant's,
+    /// else UTC: where a page's new calendar starts and a set's year is read.
+    pub(crate) async fn company_zone(&self, scope: &Scope) -> Result<String> {
+        let client = self.db.get().await?;
+        let scope = self.authentication.reprove(&**client, scope).await?;
+        let target = scope
+            .current_company()
+            .map_or(Target::Tenant, Target::Company);
+        self.zone(&**client, &scope, target).await
+    }
+    /// The sets of `codes` the reader's calendars may include (its own or
+    /// installation-wide), for the calendar page. Needs
+    /// `admin.work-calendar.view`.
+    pub(crate) async fn named_sets(
+        &self,
+        scope: &Scope,
+        codes: &[String],
+    ) -> Result<Vec<HolidaySetEntry>> {
+        let client = self.db.get().await?;
+        let scope = self.authentication.reprove(&**client, scope).await?;
+        authorize_key(&**client, &scope, VIEW).await?;
+        store::named_sets(&**client, scope.tenant(), codes).await
+    }
     /// One page of the tenant's holiday sets by code, with the total. Needs
     /// `admin.work-calendar.list`.
     pub async fn holiday_sets(
@@ -234,10 +275,99 @@ inventory::submit! { Contribution::new(DEFINITIONS, DEFAULT, provenance!(), &Set
     editor: Some(Editor { group: "Work calendars", label: "Default work calendar", help: "The calendar's code, such as \"office\". A company's own value wins over the tenant's; clear a company's value and it uses the tenant's again. A tenant left empty has none.", capability: Some(MANAGE), reveal_duration_ms: 5_000 }),
 })) }
 
+// The administration pages (issue 209): every write is a contract above.
+inventory::submit! { Contribution::new(ROUTES, "core/work_calendar.calendars", provenance!(), &Route {
+    method: Method::Get, path: web::CALENDARS, service: web::PAGES, operation: "calendars", access: Access::Capability(LIST), framed: true,
+}) }
+inventory::submit! { Contribution::new(ROUTES, "core/work_calendar.calendar", provenance!(), &Route {
+    method: Method::Get, path: web::CALENDAR, service: web::PAGES, operation: "calendar", access: Access::Capability(VIEW), framed: true,
+}) }
+inventory::submit! { Contribution::new(ROUTES, "core/work_calendar.month", provenance!(), &Route {
+    method: Method::Get, path: web::MONTH, service: web::PAGES, operation: "month", access: Access::Capability(VIEW), framed: true,
+}) }
+inventory::submit! { Contribution::new(ROUTES, "core/work_calendar.holiday_sets", provenance!(), &Route {
+    method: Method::Get, path: web::SETS, service: web::PAGES, operation: "sets", access: Access::Capability(LIST), framed: true,
+}) }
+inventory::submit! { Contribution::new(ROUTES, "core/work_calendar.holiday_set", provenance!(), &Route {
+    method: Method::Get, path: web::SET, service: web::PAGES, operation: "set", access: Access::Capability(VIEW), framed: true,
+}) }
+inventory::submit! { Contribution::new(PAGE_WRITES, web::PAGES, provenance!(), &PageWrites {
+    service: web::PAGES,
+    contracts: &[
+        ("create", "core.work_calendar.create"),
+        ("save_field", "core.work_calendar.update"),
+        ("retire", "core.work_calendar.update"),
+        ("reactivate", "core.work_calendar.update"),
+        ("set_rule", "core.work_calendar.rule.set"),
+        ("add_exception", "core.work_calendar.exception.add"),
+        ("remove_exception", "core.work_calendar.exception.remove"),
+        ("include", "core.work_calendar.include"),
+        ("leave_out", "core.work_calendar.include"),
+        ("create_set", "core.work_calendar.holiday_set.create"),
+        ("copy_set", "core.work_calendar.holiday_set.copy"),
+        ("save_set_field", "core.work_calendar.holiday_set.update"),
+        ("add_holiday", "core.work_calendar.holiday_set.holidays"),
+        ("rename_holiday", "core.work_calendar.holiday_set.holidays"),
+        ("remove_holiday", "core.work_calendar.holiday_set.holidays"),
+    ],
+    pending: Pending::None,
+}) }
+bilibi_menu::contribute!(
+    "core/work_calendar",
+    bilibi_menu::MenuItem::container("admin.work_calendar", "Work calendars")
+        .under("admin")
+        .icon("calendar-days")
+        .requires(bilibi_menu::Requirement::Capability(LIST))
+        .order(56)
+);
+bilibi_menu::contribute!(
+    "core/work_calendar",
+    bilibi_menu::MenuItem::page("admin.work_calendar.calendars", "Calendars", web::CALENDARS)
+        .under("admin.work_calendar")
+        .icon("calendar")
+        .order(10)
+);
+bilibi_menu::contribute!(
+    "core/work_calendar",
+    bilibi_menu::MenuItem::page(
+        "admin.work_calendar.holiday_sets",
+        "Holiday sets",
+        web::SETS
+    )
+    .under("admin.work_calendar")
+    .icon("flag")
+    .order(20)
+);
+// The calendars as a Grid table, for column paths and reports.
+static GRID: GridContribution = GridContribution {
+    record_fields: &[],
+    tables: &[TableDecl::new(
+        "work_calendars",
+        "Work calendars",
+        LIST,
+        Source::tenant("SELECT code,name,status,substitute,version,created_at,updated_at FROM core_work_calendars WHERE tenant_id=$1"),
+        "code",
+        &[
+            Field::new("code", "Code", FieldType::String).protected(),
+            Field::new("name", "Name", FieldType::String).protected(),
+            Field::choice("status", "Status", &["active", "retired"]),
+            Field::choice("substitute", "Substitute", &["none", "rest", "rest_and_off"]),
+            Field::new("version", "Version", FieldType::Integer).protected(),
+            Field::new("created_at", "Created", FieldType::DateTime).protected(),
+            Field::new("updated_at", "Updated", FieldType::DateTime).protected(),
+        ],
+    )
+    .label_field("name")
+    .time_field("created_at")
+    .record_types(&["core/work_calendar.calendar"])],
+    links: &[],
+};
+bilibi_grid::contribute!("core/work_calendar", "work_calendar.grid", &GRID);
+
 inventory::submit! {
     bilibi_module_registry::Module {
         id: "core/work_calendar", layer: bilibi_module_registry::Layer::Core,
-        dependencies: &["base/agent_api", "base/authz", "base/database", "base/datetime", "base/events", "base/party_ids", "base/queue", "base/settings", "base/tenancy", "core/geonames"],
+        dependencies: &["base/agent_api", "base/authz", "base/database", "base/datetime", "base/events", "base/grid", "base/menu", "base/party_ids", "base/queue", "base/settings", "base/tenancy", "base/ui", "core/geonames"],
         migrations: &[
             ("core-work-calendar-001-work-calendar", include_str!("../migrations/001-work-calendar.sql")),
             ("core-work-calendar-002-installation-holiday-sets", include_str!("../migrations/002-installation-holiday-sets.sql")),
@@ -259,6 +389,11 @@ inventory::submit! {
             Service { id: publish::HANDLER, factory: |services| {
                 Ok(Arc::new(HandlerService(Arc::new(publish::PublishJob { calendars: services.get(SERVICE)? }))))
             }},
+            Service { id: web::PAGES, factory: |services| Ok(Arc::new(bilibi_ui::page::PageService::<Scope, Error>(Arc::new(web::Pages {
+                db: services.get::<Db>("base/database.pool")?.as_ref().clone(),
+                calendars: services.get(SERVICE)?,
+                contracts: services.get(bilibi_agent_api::page::SERVICE)?,
+            })))) },
         ],
     }
 }

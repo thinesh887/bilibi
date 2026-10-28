@@ -86,6 +86,76 @@ pub(crate) async fn calendars(
         .collect();
     Ok(Rows { rows, total })
 }
+/// One row of the calendars page: the zone of the week in force today, in
+/// that week's own zone (the first version's when none has started), and the
+/// codes of included sets.
+pub(crate) struct IndexRow {
+    pub code: String,
+    pub name: String,
+    pub status: String,
+    pub zone: Option<String>,
+    pub sets: Vec<String>,
+}
+/// The calendars page's rows, paged as [`calendars`] pages them.
+pub(crate) async fn index(
+    client: &(impl GenericClient + Sync),
+    tenant: i64,
+    listing: &Listing,
+) -> Result<Rows<IndexRow>> {
+    if !listing.valid() {
+        return Err(Error::Invalid);
+    }
+    let pattern = pattern(&listing.search);
+    let total: i64 = client
+        .query_one(
+            "SELECT count(*) FROM core_work_calendars WHERE tenant_id=$1 AND (code ILIKE $2 OR name ILIKE $2)",
+            &[&tenant, &pattern],
+        )
+        .await?
+        .get(0);
+    let rows = client
+        .query(
+            "SELECT c.code,c.name,c.status,\
+             (SELECT r.timezone FROM core_work_calendar_rules r WHERE r.tenant_id=c.tenant_id AND r.calendar_id=c.id ORDER BY r.effective_from<=(now() AT TIME ZONE r.timezone)::date DESC, CASE WHEN r.effective_from<=(now() AT TIME ZONE r.timezone)::date THEN r.effective_from END DESC, r.effective_from LIMIT 1),\
+             coalesce((SELECT array_agg(s.code ORDER BY s.code) FROM core_work_calendar_includes i JOIN core_work_calendar_holiday_sets s ON s.tenant_id=i.set_tenant_id AND s.id=i.holiday_set_id WHERE i.tenant_id=c.tenant_id AND i.calendar_id=c.id),'{}') \
+             FROM core_work_calendars c WHERE c.tenant_id=$1 AND (c.code ILIKE $2 OR c.name ILIKE $2) ORDER BY c.code LIMIT $3 OFFSET $4",
+            &[&tenant, &pattern, &listing.page_size, &offset(listing.page, listing.page_size)],
+        )
+        .await?
+        .iter()
+        .map(|row| IndexRow {
+            code: row.get(0),
+            name: row.get(1),
+            status: row.get(2),
+            zone: row.get(3),
+            sets: row.get(4),
+        })
+        .collect();
+    Ok(Rows { rows, total })
+}
+/// The sets `codes` name for `tenant`, its own or installation-wide, for a
+/// calendar page's included sets.
+pub(crate) async fn named_sets(
+    client: &(impl GenericClient + Sync),
+    tenant: i64,
+    codes: &[String],
+) -> Result<Vec<HolidaySetEntry>> {
+    Ok(client
+        .query(
+            "SELECT code,name,country_iso,admin1_code,installation FROM core_work_calendar_holiday_sets WHERE code=ANY($2) AND (tenant_id=$1 OR installation) ORDER BY code",
+            &[&tenant, &codes],
+        )
+        .await?
+        .iter()
+        .map(|row| HolidaySetEntry {
+            code: row.get(0),
+            name: row.get(1),
+            country_iso: row.get(2),
+            admin1_code: row.get(3),
+            installation: row.get(4),
+        })
+        .collect())
+}
 /// The tenant's own holiday sets and the installation-wide ones, whose codes
 /// never collide (`claim`).
 pub(crate) async fn holiday_sets(
@@ -635,7 +705,10 @@ impl WorkCalendars {
                 let code = code(input, "code", &mut errors);
                 let name = name(&input["name"], "name", &mut errors);
                 let timezone = match &input["timezone"] {
-                    Value::Null => self.tenant_zone(client, scope).await?,
+                    Value::Null => {
+                        self.zone(client, scope, bilibi_settings::Target::Tenant)
+                            .await?
+                    }
                     zone => timezone(zone, &mut errors).unwrap_or_default(),
                 };
                 let substitute = match &input["substitute"] {
@@ -922,19 +995,17 @@ impl WorkCalendars {
         }
     }
 
-    async fn tenant_zone(
+    /// `localization.timezone` at `target` (company over tenant), or UTC when
+    /// unset or no longer valid.
+    pub(crate) async fn zone(
         &self,
         client: &(impl GenericClient + Sync),
         scope: &Scope,
+        target: bilibi_settings::Target,
     ) -> Result<String> {
         let zone = self
             .settings
-            .get(
-                client,
-                scope,
-                bilibi_settings::Target::Tenant,
-                bilibi_datetime::TIMEZONE_KEY,
-            )
+            .get(client, scope, target, bilibi_datetime::TIMEZONE_KEY)
             .await?
             .value;
         Ok(zone
